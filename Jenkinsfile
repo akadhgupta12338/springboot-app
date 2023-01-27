@@ -1,44 +1,88 @@
-
-node {
-  
-  def image
-  def mvnHome = tool 'Maven3'
-
-  
-     stage ('checkout') {
-        checkout([$class: 'GitSCM', branches: [[name: '*/master']], doGenerateSubmoduleConfigurations: false, extensions: [], submoduleCfg: [], userRemoteConfigs: [[credentialsId: '9ffd4ee4-3647-4a7d-a357-5e8746463282', url: 'https://bitbucket.org/ananthkannan/myawesomeangularapprepo/']]])       
+pipeline {
+    agent any
+    
+    tools
+    {
+       maven "Maven"
+    }
+     
+    stages {
+      stage('checkout') {
+           steps {
+                git branch: 'main', url: 'https://github.com/akadhgupta12338/springboot-app.git'
+          }
         }
-    
-    
-    stage ('Build') {
-            sh 'mvn -f MyAwesomeApp/pom.xml clean install'            
+         
+      stage('Execute Maven') {
+           steps {
+               sh 'mvn clean install'            
+           }
         }
         
-    stage ('archive') {
-            archiveArtifacts '**/*.jar'
-        }
-        
-    stage ('Docker Build') {
-         // Build and push image with Jenkins' docker-plugin
-        withDockerServer([uri: "tcp://localhost:4243"]) {
-
-            withDockerRegistry([credentialsId: "fa32f95a-2d3e-4c7b-8f34-11bcc0191d70", url: "https://index.docker.io/v1/"]) {
-            image = docker.build("ananthkannan/mywebapp", "MyAwesomeApp")
-            image.push()
-            
+        stage("SonarQube analysis") {
+            steps {
+              withSonarQubeEnv('sonarqube') {
+                sh 'mvn sonar:sonar'
+              }
+            }
+          }
+         
+      stage("Quality Gate") {
+            steps {
+              timeout(time: 1, unit: 'HOURS') {
+                waitForQualityGate abortPipeline: true
+              }
+            }
+          }
+   
+      stage('Jfrog Artifactory Upload'){
+            steps{
+                script{
+                    def readpom;
+                    readpom = readMavenPom file: '';
+                    def artifactversion = readpom.version;
+                rtUpload (
+                 serverId:"artifactory" ,
+                  spec: """{
+                   "files": [
+                      {
+                      "pattern": "*.jar",
+                      "target": "my-demo-libs-release-local/${artifactversion}/",
+                      "recursive": "true"
+                      }
+                            ]
+                           }""",
+                        )
+                }
             }
         }
-    }
-    
-       stage('docker stop container') {
-            sh 'docker ps -f name=myContainer -q | xargs --no-run-if-empty docker container stop'
-            sh 'docker container ls -a -fname=myContainer -q | xargs -r docker container rm'
-
-       }
-
-    stage ('Docker run') {
-
-        image.run("-p 8085:8085 --rm --name myContainer")
-
+        
+      stage ('Jfrog Artifactory Publish build info') {
+            steps {
+                rtPublishBuildInfo (
+                    serverId: "artifactory"
+                )
+            }
+        }
+        
+      stage('Building and pusing image to ECR') {
+            steps{
+              script {
+            sh 'docker build -t my-docker-repo .'
+            sh 'docker tag my-docker-repo:latest 737376305814.dkr.ecr.ap-south-1.amazonaws.com/my-docker-repo:latest'
+            sh 'aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 737376305814.dkr.ecr.ap-south-1.amazonaws.com'
+            sh 'docker push 737376305814.dkr.ecr.ap-south-1.amazonaws.com/my-docker-repo:latest'
+             }
+          }
+      }
+      
+      stage('eks deploy')
+      {
+          steps{
+              withKubeConfig(caCertificate: '', clusterName: '', contextName: '', credentialsId: 'eks-demo-k8s', namespace: '', serverUrl: ''){
+                sh "kubectl apply -f eks-deploy-from-ecr.yaml"
+              }
+          }
+       }   
     }
 }
